@@ -12,6 +12,19 @@ import QRCode from 'qrcode';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'silent' });
 
+function isPhoneJid(jid) {
+  return typeof jid === 'string' && jid.endsWith('@s.whatsapp.net');
+}
+
+function isLidJid(jid) {
+  return typeof jid === 'string' && jid.endsWith('@lid');
+}
+
+function betterDisplayName(current, next, jid) {
+  const values = [current, next].filter(Boolean);
+  return values.find((value) => value !== jid && !isLidJid(value)) || values[0] || jid;
+}
+
 function jidFromInput(value) {
   if (!value) throw new Error('jid or phone is required');
   const raw = String(value).trim();
@@ -121,6 +134,8 @@ function toPlainMessage(message) {
     jid: message?.key?.remoteJid,
     fromMe: Boolean(message?.key?.fromMe),
     participant: message?.key?.participant,
+    senderPn: message?.key?.senderPn,
+    participantPn: message?.key?.participantPn,
     pushName: message?.pushName,
     timestamp: Number(message?.messageTimestamp || 0),
     type,
@@ -169,6 +184,7 @@ export class WhatsAppService {
     this.chats = new Map();
     this.contacts = new Map();
     this.messages = new Map();
+    this.jidAliases = new Map();
     this.maxMessagesPerChat = Number(process.env.MAX_MESSAGES_PER_CHAT || 500);
   }
 
@@ -185,6 +201,10 @@ export class WhatsAppService {
       this.chats = new Map(parsed.chats || []);
       this.contacts = new Map(parsed.contacts || []);
       this.messages = new Map(parsed.messages || []);
+      this.jidAliases = new Map(parsed.jidAliases || []);
+      const inferred = this.inferJidAliasesFromStore();
+      const migrated = this.migrateStoreJids();
+      if (inferred || migrated) await this.saveStore();
     } catch (error) {
       if (error.code !== 'ENOENT') this.lastError = error.message;
     }
@@ -195,9 +215,113 @@ export class WhatsAppService {
     const payload = {
       chats: [...this.chats.entries()],
       contacts: [...this.contacts.entries()],
-      messages: [...this.messages.entries()]
+      messages: [...this.messages.entries()],
+      jidAliases: [...this.jidAliases.entries()]
     };
     await fs.writeFile(this.storePath, JSON.stringify(payload, null, 2));
+  }
+
+  canonicalJid(jid) {
+    if (!jid) return jid;
+    return this.jidAliases.get(jid) || jid;
+  }
+
+  canonicalInputJid(jid) {
+    return this.canonicalJid(jidFromInput(jid));
+  }
+
+  rememberJidAlias(alias, canonical) {
+    if (!isLidJid(alias) || !isPhoneJid(canonical) || alias === canonical) return false;
+    if (this.jidAliases.get(alias) === canonical) return false;
+    this.jidAliases.set(alias, canonical);
+    return true;
+  }
+
+  rememberMessageAliases(message) {
+    let changed = false;
+    const key = message?.key || {};
+    changed = this.rememberJidAlias(key.remoteJid, key.senderPn) || changed;
+    changed = this.rememberJidAlias(key.participant, key.participantPn) || changed;
+    return changed;
+  }
+
+  plainMessage(message) {
+    const plain = toPlainMessage(message);
+    return {
+      ...plain,
+      jid: this.canonicalJid(plain.jid),
+      participant: this.canonicalJid(plain.participant)
+    };
+  }
+
+  inferJidAliasesFromStore() {
+    let changed = false;
+    for (const list of this.messages.values()) {
+      for (const message of list) changed = this.rememberMessageAliases(message) || changed;
+    }
+    return changed;
+  }
+
+  migrateStoreJids() {
+    let changed = false;
+
+    const chats = new Map();
+    for (const [jid, chat] of this.chats.entries()) {
+      const canonical = this.canonicalJid(jid);
+      changed = changed || canonical !== jid;
+      const current = chats.get(canonical) || {};
+      const currentTimestamp = Number(current.timestamp || 0);
+      const chatTimestamp = Number(chat.timestamp || 0);
+      chats.set(canonical, {
+        ...current,
+        ...chat,
+        jid: canonical,
+        name: betterDisplayName(current.name, chat.name, canonical),
+        lastMessage: chatTimestamp >= currentTimestamp ? (chat.lastMessage ?? current.lastMessage) : current.lastMessage,
+        timestamp: Math.max(currentTimestamp, chatTimestamp),
+        isGroup: Boolean(current.isGroup || chat.isGroup || canonical.endsWith('@g.us'))
+      });
+    }
+
+    const contacts = new Map();
+    for (const [jid, contact] of this.contacts.entries()) {
+      const canonical = this.canonicalJid(jid);
+      changed = changed || canonical !== jid;
+      const current = contacts.get(canonical) || {};
+      contacts.set(canonical, {
+        ...current,
+        ...contact,
+        jid: canonical,
+        name: betterDisplayName(current.name, contact.name, canonical)
+      });
+    }
+
+    const messages = new Map();
+    for (const [jid, list] of this.messages.entries()) {
+      const canonical = this.canonicalJid(jid);
+      changed = changed || canonical !== jid;
+      const merged = messages.get(canonical) || [];
+      for (const message of list) {
+        const next = {
+          ...message,
+          jid: canonical,
+          participant: this.canonicalJid(message.participant)
+        };
+        const index = merged.findIndex((item) => item.id === next.id);
+        if (index >= 0) merged[index] = { ...merged[index], ...next };
+        else merged.push(next);
+      }
+      merged.sort((a, b) => a.timestamp - b.timestamp);
+      messages.set(canonical, merged.slice(-this.maxMessagesPerChat));
+    }
+
+    if (changed) {
+      this.chats = chats;
+      this.contacts = contacts;
+      this.messages = messages;
+    }
+
+    return changed;
   }
 
   async connect() {
@@ -273,7 +397,15 @@ export class WhatsAppService {
     for (const chat of chats) {
       const normalized = normalizeChat(chat);
       if (!normalized.jid) continue;
-      this.chats.set(normalized.jid, { ...(this.chats.get(normalized.jid) || {}), ...normalized });
+      const rawJid = normalized.jid;
+      normalized.jid = this.canonicalJid(rawJid);
+      if (normalized.name === rawJid) normalized.name = normalized.jid;
+      const current = this.chats.get(normalized.jid) || {};
+      this.chats.set(normalized.jid, {
+        ...current,
+        ...normalized,
+        name: betterDisplayName(current.name, normalized.name, normalized.jid)
+      });
     }
     this.saveStore().catch(() => {});
   }
@@ -282,7 +414,15 @@ export class WhatsAppService {
     for (const contact of contacts) {
       const normalized = normalizeContact(contact);
       if (!normalized.jid) continue;
-      this.contacts.set(normalized.jid, { ...(this.contacts.get(normalized.jid) || {}), ...normalized });
+      const rawJid = normalized.jid;
+      normalized.jid = this.canonicalJid(rawJid);
+      if (normalized.name === rawJid) normalized.name = normalized.jid;
+      const current = this.contacts.get(normalized.jid) || {};
+      this.contacts.set(normalized.jid, {
+        ...current,
+        ...normalized,
+        name: betterDisplayName(current.name, normalized.name, normalized.jid)
+      });
       const chat = this.chats.get(normalized.jid);
       if (chat && (!chat.name || chat.name === normalized.jid)) {
         this.chats.set(normalized.jid, { ...chat, name: normalized.name });
@@ -293,7 +433,9 @@ export class WhatsAppService {
 
   upsertMessages(messages = []) {
     for (const message of messages) {
-      const plain = toPlainMessage(message);
+      const aliasChanged = this.rememberMessageAliases(message);
+      if (aliasChanged) this.migrateStoreJids();
+      const plain = this.plainMessage(message);
       if (!plain.jid || !plain.id) continue;
       const fallbackName = this.resolveChatName(plain.jid, message?.pushName);
       const chat = this.chats.get(plain.jid) || { jid: plain.jid, name: fallbackName, isGroup: plain.jid.endsWith('@g.us') };
@@ -317,7 +459,7 @@ export class WhatsAppService {
 
   mergeMessageUpdates(updates = []) {
     for (const update of updates) {
-      const jid = update.key?.remoteJid;
+      const jid = this.canonicalJid(update.key?.remoteJid);
       const id = update.key?.id;
       const list = this.messages.get(jid) || [];
       const index = list.findIndex((item) => item.id === id);
@@ -334,7 +476,7 @@ export class WhatsAppService {
   }
 
   findMessage(jid, id) {
-    return (this.messages.get(jid) || []).find((message) => message.id === id);
+    return (this.messages.get(this.canonicalJid(jid)) || []).find((message) => message.id === id);
   }
 
   resolveChatName(jid, fallback) {
@@ -426,7 +568,7 @@ export class WhatsAppService {
   }
 
   readMessages({ jid, limit = 50 }) {
-    const target = jidFromInput(jid);
+    const target = this.canonicalInputJid(jid);
     return (this.messages.get(target) || []).slice(-limit).map((message) => this.enrichMessage(message));
   }
 
@@ -440,16 +582,16 @@ export class WhatsAppService {
 
   async sendText({ jid, text, quotedMessageId }) {
     const sock = this.requireSocket();
-    const target = jidFromInput(jid);
+    const target = this.canonicalInputJid(jid);
     const quoted = quotedMessageId ? this.findMessage(target, quotedMessageId) : undefined;
     const result = await sock.sendMessage(target, { text }, quoted ? { quoted } : undefined);
     this.upsertMessages(result ? [result] : []);
-    return this.enrichMessage(toPlainMessage(result));
+    return this.enrichMessage(this.plainMessage(result));
   }
 
   async sendMedia({ jid, type, url, caption = '', fileName, mimetype }) {
     const sock = this.requireSocket();
-    const target = jidFromInput(jid);
+    const target = this.canonicalInputJid(jid);
     const media = { url };
     const contentByType = {
       image: { image: media, caption },
@@ -461,64 +603,64 @@ export class WhatsAppService {
     if (!contentByType[type]) throw new Error(`Unsupported media type: ${type}`);
     const result = await sock.sendMessage(target, contentByType[type]);
     this.upsertMessages(result ? [result] : []);
-    return this.enrichMessage(toPlainMessage(result));
+    return this.enrichMessage(this.plainMessage(result));
   }
 
   async markRead({ jid, messageId, participant }) {
     const sock = this.requireSocket();
-    const target = jidFromInput(jid);
-    await sock.readMessages([{ remoteJid: target, id: messageId, participant }]);
+    const target = this.canonicalInputJid(jid);
+    await sock.readMessages([{ remoteJid: target, id: messageId, participant: this.canonicalJid(participant) }]);
     return { ok: true };
   }
 
   async react({ jid, messageId, emoji, participant }) {
     const sock = this.requireSocket();
-    const target = jidFromInput(jid);
-    return sock.sendMessage(target, { react: { text: emoji, key: { remoteJid: target, id: messageId, participant } } });
+    const target = this.canonicalInputJid(jid);
+    return sock.sendMessage(target, { react: { text: emoji, key: { remoteJid: target, id: messageId, participant: this.canonicalJid(participant) } } });
   }
 
   async editMessage({ jid, messageId, text }) {
     const sock = this.requireSocket();
-    const target = jidFromInput(jid);
+    const target = this.canonicalInputJid(jid);
     return sock.sendMessage(target, { text, edit: { remoteJid: target, id: messageId, fromMe: true } });
   }
 
   async deleteMessage({ jid, messageId, fromMe = true, participant }) {
     const sock = this.requireSocket();
-    const target = jidFromInput(jid);
-    return sock.sendMessage(target, { delete: { remoteJid: target, id: messageId, fromMe, participant } });
+    const target = this.canonicalInputJid(jid);
+    return sock.sendMessage(target, { delete: { remoteJid: target, id: messageId, fromMe, participant: this.canonicalJid(participant) } });
   }
 
   async checkPhones({ phones }) {
     const sock = this.requireSocket();
-    const jids = phones.map(jidFromInput);
+    const jids = phones.map((phone) => this.canonicalInputJid(phone));
     return sock.onWhatsApp(...jids);
   }
 
   async profilePicture({ jid }) {
     const sock = this.requireSocket();
-    const target = jidFromInput(jid);
+    const target = this.canonicalInputJid(jid);
     return { jid: target, url: await sock.profilePictureUrl(target, 'image') };
   }
 
   async groupMetadata({ jid }) {
     const sock = this.requireSocket();
-    return sock.groupMetadata(jidFromInput(jid));
+    return sock.groupMetadata(this.canonicalInputJid(jid));
   }
 
   async createGroup({ subject, participants }) {
     const sock = this.requireSocket();
-    return sock.groupCreate(subject, participants.map(jidFromInput));
+    return sock.groupCreate(subject, participants.map((participant) => this.canonicalInputJid(participant)));
   }
 
   async updateGroupParticipants({ jid, participants, action }) {
     const sock = this.requireSocket();
-    return sock.groupParticipantsUpdate(jidFromInput(jid), participants.map(jidFromInput), action);
+    return sock.groupParticipantsUpdate(this.canonicalInputJid(jid), participants.map((participant) => this.canonicalInputJid(participant)), action);
   }
 
   async setPresence({ jid, presence }) {
     const sock = this.requireSocket();
-    await sock.sendPresenceUpdate(presence, jid ? jidFromInput(jid) : undefined);
+    await sock.sendPresenceUpdate(presence, jid ? this.canonicalInputJid(jid) : undefined);
     return { ok: true };
   }
 
