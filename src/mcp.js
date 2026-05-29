@@ -7,6 +7,18 @@ function text(data) {
   };
 }
 
+export function normalizeSendTextArgs(args = {}) {
+  const jid = args.jid || args.to || args.phone || args.recipient;
+  const textValue = args.text || args.message || args.content || args.body;
+  if (!jid) throw new Error('jid, to, phone or recipient is required');
+  if (!textValue) throw new Error('text, message, content or body is required');
+  return {
+    jid,
+    text: textValue,
+    quotedMessageId: args.quotedMessageId
+  };
+}
+
 function tool(server, name, description, inputSchema, handler) {
   server.registerTool(name, { description, inputSchema }, async (args) => {
     try {
@@ -19,6 +31,22 @@ function tool(server, name, description, inputSchema, handler) {
 
 export function createMcpServer(whatsapp) {
   const server = new McpServer({ name: 'whatsapp-baileys-mcp', version: '0.1.0' });
+  const sendTextInput = {
+    jid: z.string(),
+    text: z.string(),
+    quotedMessageId: z.string().optional()
+  };
+  const sendTextAliasInput = {
+    jid: z.string().optional(),
+    to: z.string().optional(),
+    phone: z.string().optional(),
+    recipient: z.string().optional(),
+    text: z.string().optional(),
+    message: z.string().optional(),
+    content: z.string().optional(),
+    body: z.string().optional(),
+    quotedMessageId: z.string().optional()
+  };
 
   tool(server, 'whatsapp_status', 'Return WhatsApp connection, QR and cache status.', {}, () => whatsapp.getStatus());
   tool(server, 'whatsapp_list_chats', 'List cached WhatsApp chats.', {
@@ -37,11 +65,9 @@ export function createMcpServer(whatsapp) {
   tool(server, 'whatsapp_check_phones', 'Check which phone numbers are registered on WhatsApp.', {
     phones: z.array(z.string()).min(1).max(50)
   }, (args) => whatsapp.checkPhones(args));
-  tool(server, 'whatsapp_send_text', 'Send a text message to a chat, phone number or group jid.', {
-    jid: z.string(),
-    text: z.string(),
-    quotedMessageId: z.string().optional()
-  }, (args) => whatsapp.sendText(args));
+  tool(server, 'whatsapp_send_text', 'Send a text message to a chat, phone number or group jid.', sendTextInput, (args) => whatsapp.sendText(args));
+  tool(server, 'send', 'Alias for whatsapp_send_text. Accepts jid/to/phone/recipient and text/message/content/body.', sendTextAliasInput, (args) => whatsapp.sendText(normalizeSendTextArgs(args)));
+  tool(server, 'message', 'Alias for whatsapp_send_text. Accepts jid/to/phone/recipient and text/message/content/body.', sendTextAliasInput, (args) => whatsapp.sendText(normalizeSendTextArgs(args)));
   tool(server, 'whatsapp_send_media', 'Send image, video, audio, document or sticker by local path/URL.', {
     jid: z.string(),
     type: z.enum(['image', 'video', 'audio', 'document', 'sticker']),

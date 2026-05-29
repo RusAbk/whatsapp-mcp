@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { createMcpServer } from './mcp.js';
+import { createMcpServer, normalizeSendTextArgs } from './mcp.js';
 import { WhatsAppService } from './whatsapp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -62,7 +62,30 @@ app.post('/api/send', async (req, res, next) => {
   }
 });
 
+const directMcpSendMethods = new Set(['send', 'message', 'whatsapp_send_text']);
+
+async function handleDirectMcpMethod(req, res) {
+  const body = req.body;
+  if (!body || !directMcpSendMethods.has(body.method)) return false;
+
+  try {
+    const params = body.params?.arguments || body.params || {};
+    const result = await whatsapp.sendText(normalizeSendTextArgs(params));
+    res.json({ jsonrpc: '2.0', result, id: body.id ?? null });
+  } catch (error) {
+    res.json({
+      jsonrpc: '2.0',
+      error: { code: -32602, message: error.message },
+      id: body.id ?? null
+    });
+  }
+
+  return true;
+}
+
 app.post('/mcp', async (req, res) => {
+  if (await handleDirectMcpMethod(req, res)) return;
+
   const server = createMcpServer(whatsapp);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   try {
