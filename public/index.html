@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WhatsApp MCP</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="sidebar">
+        <div class="topbar">
+          <div>
+            <h1>WhatsApp MCP</h1>
+            <p id="account">Not connected</p>
+          </div>
+          <span id="status" class="status">idle</span>
+        </div>
+        <div id="qrPanel" class="qr-panel hidden">
+          <img id="qr" alt="WhatsApp login QR">
+          <button id="refresh">Refresh</button>
+        </div>
+        <div class="search-row">
+          <input id="search" type="search" placeholder="Search chats">
+          <button id="refreshNames">Names</button>
+          <button id="logout">Logout</button>
+        </div>
+        <div id="chats" class="chats"></div>
+      </section>
+      <section class="chat">
+        <header>
+          <div>
+            <h2 id="chatName">Select a chat</h2>
+            <p id="chatJid"></p>
+          </div>
+        </header>
+        <div id="messages" class="messages"></div>
+        <form id="composer" class="composer">
+          <input id="messageInput" autocomplete="off" placeholder="Message text">
+          <button type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
